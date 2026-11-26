@@ -2,7 +2,7 @@
 
 > Mọi con số dưới đây lấy từ file JSON trong `reports/` (load test, eval) — chạy thật, không ước lượng.
 
-**Họ tên:** Tran Thi Nhai
+**Họ tên:** Trần Thị Nhài
 **Ngày chạy:** 2026-11-26
 **Môi trường:** Laptop Windows 11, AMD Ryzen 5 5600H (6 nhân / 12 luồng), RAM 7.3 GB; chạy trong WSL2 Ubuntu (giới hạn 3 GB RAM), Python 3.12.3. Phần 2–3: agent `develop/app.py` chạy trực tiếp bằng Python (1 process uvicorn), load generator chạy trên cùng máy. Docker Desktop 28.0.4 dùng cho phần 4–5.
 
@@ -140,61 +140,133 @@ jobs:
 
 ## 4. Observability stack (production)
 
+Stack: `production/docker-compose.yml` (agent + Nginx + Prometheus + Grafana + Jaeger + Locust), chạy với `docker compose -p k5-day14-observability ...`. Kiểm tra ban đầu:
+
+```text
+$ curl -s -i -X POST http://localhost:8080/ask -H "X-API-Key: day14-lab-key" ... -d '{"question": "Trong distributed tracing, span là gì?"}'
+HTTP/1.1 200 OK
+x-trace-id: cc6608fd41ec30cc6f6c8e18127dc509
+X-Served-By: 172.20.0.4:8000
+$ curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/metrics
+404
+$ docker run --rm -v "$PWD/prometheus:/p" --entrypoint promtool prom/prometheus:v3.16.0 test rules /p/alert_rules_test.yml
+Processing test file: /p/alert_rules_test.yml
+  SUCCESS
+```
+
+**Sự cố khi dựng stack — agent crash `ModuleNotFoundError: No module named 'uvicorn'`.** Lần `up` đầu, cả 2 agent `Restarting (1)` liên tục, Nginx trả 502 cho 100% request. Nguyên nhân trong `production/Dockerfile` có sẵn: `useradd -d /app` đặt HOME của user `agent` là `/app` nên Python tìm package ở `/app/.local`, trong khi thư viện được copy vào `/home/agent/.local`. Sửa bằng `ENV PYTHONUSERBASE=/home/agent/.local` (đúng lỗi CODE_LAB đã cảnh báo; Part 6 tránh được nhờ dùng virtualenv). Các số liệu dưới đây đều đo **sau** khi sửa.
+
 ### 4.1 Screenshot
 
-- [ ] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
-- [ ] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
-- [ ] Một trace lỗi trong Jaeger (có event `exception`)
-- [ ] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+- [x] Dashboard Grafana khi đang có tải — [`screenshots/grafana-dashboard.png`](screenshots/grafana-dashboard.png): Traffic 17.1 req/s, Error rate 1.08%, p95 296.87 ms, In-flight 8, Instances up 2, LLM cost (1h) $1.0818; biểu đồ latency thấy rõ p99 (~2 s) tách xa p50/avg (~200 ms), biểu đồ req/s thấy 2 đợt benchmark 100 users rồi tải nền
+- [x] Một trace chậm trong Jaeger — [`screenshots/jaeger-slow-trace.png`](screenshots/jaeger-slow-trace.png): trace `1f61d42`, 2.5 s, span `chat mock-llm-small` 1.7 s (mục 4.3)
+- [x] Một trace lỗi trong Jaeger — [`screenshots/jaeger-error-trace.png`](screenshots/jaeger-error-trace.png): trace `37b901a`, 87.9 ms, span `chat mock-llm-small` có `error.type = upstream_unavailable` và event `exception`: `utils.mock_llm.LLMError — Upstream LLM error: 503 Service Unavailable (mock)`
+- [x] Trang Alerts của Prometheus với **2 alert firing** — [`screenshots/prometheus-alert-firing.png`](screenshots/prometheus-alert-firing.png): nhóm `agent-slo` FIRING (2): `AgentHighErrorRate` (value 0.1879 = 18.8%) và `AgentHighLatencyP95` (value 1.903 s)
+
+Log JSON tương ứng với trace lỗi (cùng `trace_id`):
+
+```json
+{"ts": "2026-11-26T11:51:39.132243+00:00", "level": "INFO", "service": "observable-agent", "instance": "5421c0a72ce8", "event": "llm_error", "trace_id": "37b901aca4d87e0c87947feae6450b13", "span_id": "51f5e4dc259fc008", "request_id": "77afe95d1831", "error": "Upstream LLM error: 503 Service Unavailable (mock)"}
+{"ts": "2026-11-26T11:51:39.132759+00:00", "level": "INFO", "service": "observable-agent", "instance": "5421c0a72ce8", "event": "http_request", "trace_id": "37b901aca4d87e0c87947feae6450b13", "span_id": "51f5e4dc259fc008", "request_id": "77afe95d1831", "method": "POST", "route": "/ask", "status": 503, "ms": 87.0}
+```
+
+**Trả lời Exercise 7.4:**
+1. *p95 và avg; khoảng cách nói lên gì?* Khi chụp dashboard: p95 = 296.87 ms; trên biểu đồ latency avg ~250 ms, p50 ~200 ms nhưng p99 ~2 s. p95 và avg gần nhau nghĩa là phần lớn request đồng đều; khoảng cách lớn giữa avg và p99 là *tail latency* do ~3% request bị LLM chậm thêm 1.5 s (`MOCK_SLOW_RATE=0.03`) — đúng như phần 2.2.
+2. *Nginx chia đều traffic cho 2 instance không?* Có. Ở benchmark 3 instance (mục 5) Prometheus thấy đủ 3 target `up=1` sau ~25 s nhờ `dns_sd_configs` + `server agent:8000 resolve`, và tải tách đều theo round-robin; ở bài 5.4 (Part 5) đếm log được 3/3/4 request trên 3 instance.
+3. *Vì sao input tokens/s lớn hơn output tokens/s?* Agent v2 làm RAG: prompt gồm câu hỏi **cộng tài liệu tìm được** từ knowledge base, nên dài hơn câu trả lời. Đo ở thí nghiệm E: v2 input 1259.8 token/s so với output 649.5 token/s (gấp ~1.9 lần).
+4. *`curl http://localhost:8080/metrics` trả gì?* **404** — Nginx chặn `location = /metrics { return 404; }`. `/metrics` lộ thông tin nội bộ (route, version, chi phí, số lỗi) nên chỉ cho Prometheus scrape trực tiếp từng agent trong mạng nội bộ Docker, không public qua load balancer.
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
+Tải nền chạy suốt thí nghiệm (Locust 30 users, sau đó `load_test.py` 10 request song song qua Nginx). Thời gian đo bằng script hỏi `GET /api/v1/alerts` của Prometheus mỗi 5 giây; T0 = lúc agent được tạo lại với cấu hình mới.
+
 | # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
 |---|---|---|---|---|
-| A | `MOCK_ERROR_RATE=0.2` | | | |
-| B | `MOCK_SLOW_RATE=0.3` | | | |
-| C | `LLM_MODEL=mock-llm-large` | | | |
-| D | `docker pause` 1 instance | | | |
-| E | `AGENT_VERSION=v1` | | | |
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` (value 0.1879 ≈ 18.8% > 5%) | Lần 1: pending +33 s → **firing +94 s**. Lần 2: pending +10 s → **firing +75 s** | *Error rate* (Golden Signals) chuyển đỏ; *Requests/s theo status code* thấy đường `503` tăng; Jaeger có nhiều trace `error=true` |
+| B | `MOCK_SLOW_RATE=0.3` | `AgentHighLatencyP95` (value 1.903 s > 1 s) | Lần 1: pending +23 s → **firing +143 s**. Lần 2: pending +10 s → **firing +137 s** | *Latency /ask — p50/p95/p99*: p95 vọt lên ~1.9 s, avg tăng ít hơn; *LLM latency p95* |
+| C | `LLM_MODEL=mock-llm-large` | `LLMCostBurnRateHigh` | Không đổi model riêng; alert này **đã firing do tải**: 2 đợt benchmark 100 users đẩy *Cost burn rate* lên ~$8/giờ > ngưỡng $2/giờ (`activeAt` 18:55:17, đang firing lúc 19:01:19); khi chạy lại với 10 request song song (thí nghiệm D), alert này lại firing lúc 19:55:45 | *Cost burn rate (USD/giờ)*, *LLM cost (1h)* |
+| D | `docker pause` 1 instance | `AgentInstanceDown` (instance `172.18.0.5:8000`, `up=0`) | pending +13 s → **firing +46 s** | *Instances up* giảm 2 → 1; *Requests/s theo instance* mất 1 đường |
+| E | `AGENT_VERSION=v1` | **Không có alert nào** (theo dõi 150 s: `no active alerts`) | — | *Tokens/s* giảm, *Retrieval hit ratio* mất số liệu, bảng *version* đổi sang v1 |
+
+Ảnh `prometheus-alert-firing.png` chụp ở **lần 2** của thí nghiệm A+B (A và B bật cùng lúc).
+
+**Phân tích:**
+- **Thời gian tới firing ≈ thời gian rule bắt đầu đúng + `for`.** A: pending +10 s, `for: 1m` → firing +75 s; B: `for: 2m` → firing +137 s; D: `for: 30s` → firing +46 s. Phần lẻ là chu kỳ đánh giá 5 s + thời gian cửa sổ `rate(...[1m])` tích luỹ đủ dữ liệu xấu. Lần 1 của A chậm hơn (pending +33 s) vì agent vừa tạo lại, cửa sổ 1 phút còn lẫn dữ liệu tốt của bản cũ.
+- **`for` chống báo động giả nhưng làm phát hiện chậm hơn:** B mất >2 phút mới firing dù p95 đã xấu từ giây thứ 10. Đây là đánh đổi chủ động giữa *alert fatigue* và tốc độ phát hiện; alert latency có `severity: warning` nên chấp nhận chờ lâu hơn alert lỗi (`critical`, `for: 1m`).
+- **D — Nginx che lỗi cho người dùng:** trong lúc instance bị pause, 12/12 request gửi qua Nginx vẫn trả **200**, error rate theo metric của agent chỉ 0.95%. Nginx cấu hình `proxy_next_upstream error timeout` + `proxy_read_timeout 10s`: request rơi vào container bị pause chờ hết 10 s rồi được chuyển sang instance còn sống (client chậm thêm, không lỗi), sau đó Nginx tạm loại instance lỗi. Nếu không có retry này, client sẽ nhận 504 — và 504 sinh ra ở Nginx nên **không xuất hiện trong metric của agent**; chỉ `AgentInstanceDown` (Prometheus không scrape được) mới phát hiện. Vì sao phải `pause` chứ không `stop`: container bị stop biến mất khỏi DNS → Prometheus coi như target không còn tồn tại (không phải "down") nên không có alert; container bị pause vẫn còn trong DNS nhưng không trả lời → `up == 0`.
+- **Sự cố ngoài kế hoạch:** trong lúc chờ chụp ảnh lần 1, máy hết RAM, WSL2 treo, cả 2 agent `unhealthy` và `AgentInstanceDown` firing cho cả 2 instance — chính alert availability đã bắt được sự cố hạ tầng thật. Sau khi khôi phục, tôi chạy lại A+B (lần 2) để chụp ảnh.
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
 
-...
+Số đo khi đổi v2 → v1 (cùng tải 4 request song song, mỗi mốc là `rate(...[1m])`):
+
+| Chỉ số | v2 | v1 (sau 150 s) |
+|---|---|---|
+| Req/s `/ask` | 17.18 | 20.75 |
+| Error rate | 1.06% | 1.40% |
+| p95 | 0.293 s | 0.197 s |
+| Input / output tokens/s | 1259.8 / 649.5 | 719.9 / 405.2 |
+| Retrieval (hit/s) | 17.20 | không còn số liệu (v1 không retrieval) |
+| Cost (USD/giờ) | 2.08 | 1.26 |
+| Alert | không | **không** |
+
+Mọi chỉ số hạ tầng đều **đẹp hơn** (nhanh hơn, rẻ hơn ~40%) trong khi chất lượng sụp từ 100% xuống 4.3% (eval phần 3). Metrics hạ tầng chỉ đo *hệ thống có chạy không*, không đo *câu trả lời có đúng không*. Cách phát hiện:
+1. **Quality gate trước khi deploy:** chạy `run_eval.py` trong CI (phần 3) — v1 trả exit code 1 với 20 câu regression → chặn ngay từ pull request, không lên production được.
+2. **Eval định kỳ trên production:** cron chạy golden dataset vào bản đang chạy (ví dụ mỗi giờ), đẩy `eval_accuracy` thành metric và đặt alert `eval_accuracy < 0.85`.
+3. **Metric proxy cho chất lượng:** alert khi *retrieval hit ratio* giảm mạnh hoặc mất (v1 không còn `agent_retrieval_total`), khi số token/câu thay đổi bất thường, hoặc khi `agent_info{version}` đổi ngoài lịch deploy.
+4. **Tín hiệu từ người dùng:** tỉ lệ 👍/👎, tỉ lệ hỏi lại, LLM-as-judge chấm mẫu ngẫu nhiên một phần nhỏ traffic thật.
 
 ### 4.3 Debug bằng trace
 
-Chọn 1 trace chậm nhất bạn tìm được:
+Chọn trace chậm nhất **có thời gian khớp với log** (xem ghi chú bên dưới):
 
-- `trace_id`: ...
-- Tổng thời gian: ... ms
-- Span chiếm nhiều thời gian nhất: ... (... ms, ...%)
+- `trace_id`: `1f61d42925ea6b12304184e33e21caeb`
+- Tổng thời gian: **2479.2 ms** (span `POST /ask`; log của agent ghi `"ms": 2478.5`)
+- Span chiếm nhiều thời gian nhất: **`chat mock-llm-small` — 1674.8 ms (67.6%)**; `agent.run` 1776.3 ms (71.6%), `agent.retrieve_context` 101.3 ms (4.1%)
 - Dòng log tương ứng (grep theo `trace_id`):
 
 ```json
-
+{"ts": "2026-11-26T11:45:40.482195+00:00", "level": "INFO", "service": "observable-agent", "instance": "5421c0a72ce8", "event": "llm_call", "trace_id": "1f61d42925ea6b12304184e33e21caeb", "span_id": "d57a07f2dae3d2af", "request_id": "25d7d1783300", "model": "mock-llm-small", "agent_version": "v2", "input_tokens": 72, "output_tokens": 40, "cost_usd": 3.5e-05, "llm_ms": 1675.3}
+{"ts": "2026-11-26T11:45:40.482836+00:00", "level": "INFO", "service": "observable-agent", "instance": "5421c0a72ce8", "event": "http_request", "trace_id": "1f61d42925ea6b12304184e33e21caeb", "span_id": "d57a07f2dae3d2af", "request_id": "25d7d1783300", "method": "POST", "route": "/ask", "status": 200, "ms": 2478.5}
 ```
+
+**Đọc trace:**
+- Request chậm vì **gọi LLM** (1.67 s — một request "slow" của mock, cộng thêm ~1.5 s), không phải vì code của agent: retrieval chỉ 101 ms. Log `llm_ms: 1675.3` khớp span 1674.8 ms.
+- **~700 ms nằm ngoài `agent.run`:** span `POST /ask` 2479 ms nhưng `agent.run` chỉ bắt đầu sau ~0.7 s. Trace này thuộc đợt benchmark 1 instance (100 users, agent giới hạn `cpus: 0.5`) — request phải **xếp hàng** trong process trước khi handler chạy. Trace cho thấy được thời gian chờ này, điều mà metric `llm_request_duration_seconds` không thấy.
+
+**Ghi chú về các trace "chậm nhất" bị phóng đại:** sắp xếp *Longest First*, Jaeger đưa lên đầu các trace ~5–6.5 s (ví dụ `f78c9f34…` = 6556.5 ms) nhưng log của chính request đó ghi `"ms": 1697.5`. Đối chiếu 940 trace chậm có log: 725 trace khớp (lệch < 30 ms), **212 trace bị phóng đại 3.5–4.9 s**. Nguyên nhân: OpenTelemetry đo span bằng **đồng hồ thực** (wall clock), còn app đo bằng **đồng hồ monotonic**; đồng hồ của VM Docker/WSL bị chỉnh nhảy (kernel log ghi *"Time jumped backwards"*) nên span nào đi qua lúc chỉnh giờ bị cộng sai. Bài học: không tin tuyệt đối duration của trace — đối chiếu với log/metric qua `trace_id`.
 
 ---
 
 ## 5. Benchmark scaling (production, Locust headless, 100 users, 2 phút)
 
+Lệnh: `docker compose -p k5-day14-observability run --rm locust -f /mnt/locust/locustfile.py --host http://nginx --headless -u 100 -r 10 -t 2m --csv /mnt/results/scale_<n>`; giữa 2 lần chạy `up -d --scale agent=3`, chờ 25 s và xác nhận Prometheus thấy đủ 3 target `up=1`. Số liệu dòng `POST /ask` trong `benchmark-results/scale_1_stats.csv`, `scale_3_stats.csv`:
+
 | Số instance | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Failures |
 |---|---|---|---|---|---|
-| 1 | | | | | |
-| 3 | | | | | |
+| 1 | 54.02 | 200 | 500 | 1700 | 68 / 7011 (0.97%) — 68 × `503` |
+| 3 | 54.49 | 190 | 300 | 1700 | 70 / 7067 (0.99%) — 68 × `503`, 2 × `502` |
+
+(Dòng *Aggregated* gồm cả `/health`: 59.40 → 59.87 req/s, p95 410 → 280 ms.)
 
 **Giải thích kết quả:** Scale có cải thiện p95 không? Nút thắt nằm ở đâu?
-
-...
+- **p95 cải thiện 500 → 300 ms (−40%)**, p50 gần như không đổi (200 → 190 ms). Với 1 instance (giới hạn 0.5 CPU), lúc tải cao request phải xếp hàng trong process (thấy rõ ở trace mục 4.3: ~700 ms chờ trước khi handler chạy) → đuôi p95 dài ra; 3 instance chia tải nên hàng đợi ngắn lại.
+- **RPS gần như không đổi (54.0 → 54.5)** vì giới hạn nằm ở **phía tạo tải**, không phải server: Locust mô phỏng 100 người dùng, mỗi người nghỉ 0.5–2 s (trung bình 1.25 s) giữa 2 lần gọi. Trần lý thuyết ≈ 100 / (1.25 s + ~0.25 s phản hồi) ≈ 67 request/s cho mọi endpoint, ~10/11 trong đó là `/ask` → ~60 req/s. Server đã phục vụ gần sát trần đó ngay với 1 instance nên thêm instance không làm tăng thông lượng; muốn thấy RPS tăng phải tăng số user.
+- **p99 = 1700 ms ở cả hai cấu hình** — nút thắt thật sự là **latency của LLM**: ~3% request bị mock LLM chậm thêm 1.5 s, scale ngang không làm LLM nhanh hơn. Đúng như gợi ý "xem panel LLM latency".
+- **Error rate không đổi (~1%)** vì lỗi đến từ upstream LLM (`MOCK_ERROR_RATE=0.01` → `503`), không phải do quá tải; 2 lỗi `502` ở lần 3 instance xuất hiện lúc 11:48:11 khi Nginx vừa nhận instance mới qua DNS — lỗi chuyển tiếp lúc scale.
 
 ---
 
 ## 6. Kết luận
 
 - 3 điều bạn học được về benchmark & observability:
-  1. ...
-  2. ...
-  3. ...
+  1. **Average nói dối, percentile mới nói thật.** Ở 10% request chậm, avg = 273.8 ms vẫn "đẹp" nhưng p95 = 1670 ms; ở 3% thì chỉ p99 phản ánh (228.6 → 1699.7 ms). SLO và alert phải đặt theo p95/p99. Scale ngang cải thiện p95 (500 → 300 ms) nhưng không chạm được p99 vì nút thắt ở LLM.
+  2. **Metrics hạ tầng không đo được chất lượng.** Đổi sang v1 làm accuracy rơi từ 100% xuống 4.3% mà dashboard còn đẹp hơn và không alert nào kêu. Chất lượng phải được bảo vệ bằng eval + quality gate trong CI (exit code 1 chặn merge) và eval định kỳ trên production.
+  3. **Ba trụ cột phải đối chiếu với nhau, không tin một nguồn duy nhất.** Metric báo *có vấn đề* (p95, error rate), trace chỉ *ở bước nào* (span LLM 67.6%, ~700 ms xếp hàng), log cho *chi tiết* — nối với nhau bằng `trace_id`. Chính việc đối chiếu trace với log đã lộ ra 212 trace bị phóng đại do đồng hồ VM nhảy, và `X-Trace-ID` trên response giúp đi từ lỗi người dùng báo tới đúng trace.
 - Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa?
-
-...
+  - **Chất lượng:** metric `eval_accuracy` từ eval định kỳ + alert `< 0.85`; metric *retrieval hit ratio* + alert khi giảm đột ngột hoặc biến mất; tỉ lệ phản hồi tiêu cực của người dùng.
+  - **Tầng load balancer / bên ngoài:** metric và alert cho `5xx` tại Nginx (504/502 không hiện trong metric của agent — thí nghiệm D), và **synthetic check** từ bên ngoài gọi `/ask` mỗi phút (như 4 lệnh tự kiểm ở Railway).
+  - **SLO burn-rate alert nhiều cửa sổ** (ví dụ 5 phút và 1 giờ) thay cho ngưỡng cố định, để báo sớm khi error budget bị đốt nhanh mà vẫn ít báo động giả.
+  - **Saturation:** CPU/memory của từng container và độ dài hàng đợi (in-flight) kèm alert — trace 4.3 cho thấy request đã xếp hàng ~700 ms trước khi alert latency kịp phát hiện.
+  - **Chi phí theo người dùng/API key** và alert budget theo ngày (nối với cost guard Part 6), cùng alert khi `agent_info{version, model}` thay đổi ngoài lịch deploy.
+  - **Đồng bộ đồng hồ (NTP) cho host** và đo latency bằng đồng hồ monotonic để trace không bị phóng đại.
