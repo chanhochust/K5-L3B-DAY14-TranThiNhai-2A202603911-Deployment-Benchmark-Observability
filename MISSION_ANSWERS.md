@@ -1372,6 +1372,205 @@ Kết luận:
 
 ---
 
+## Part 6: Final Project — Production-ready agent
+
+Code nằm trong `06-lab-complete/`. Kết quả chấm bằng `python check_production_ready.py` (chế độ đầy đủ, có Docker, chạy trong WSL2 Ubuntu): **PASS 12/12 · 41/41 checks**.
+
+### Output `check_production_ready.py` — 📋 Checklist Deliverable
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 41/41 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+<details>
+<summary>Chi tiết từng check (output đầy đủ)</summary>
+
+```text
+✅ 1. Dockerfile (multi-stage, < 500 MB)
+     ✅ Dockerfile tồn tại
+     ✅ requirements.txt tồn tại
+     ✅ Multi-stage build (≥ 2 lệnh FROM)
+     ✅ Base image gọn (slim / alpine / distroless) — stage cuối dùng python:3.11-slim
+     ✅ Chạy bằng user non-root
+     ✅ Có HEALTHCHECK
+     ✅ Docker: build image thành công — 1s
+     ✅ Docker: image < 500 MB — 183 MB
+     ✅ Docker: container chạy được, GET /health → 200
+
+✅ 2. docker-compose.yml (agent + redis)
+     ✅ docker-compose.yml tồn tại
+     ✅ Có service agent (build từ Dockerfile) + redis — services: agent, redis — đọc bằng docker compose config
+     ✅ Service agent kết nối redis (REDIS_URL + depends_on)
+
+✅ 3. .dockerignore
+     ✅ .dockerignore tồn tại và có nội dung
+     ✅ .dockerignore loại trừ .env (secrets)
+     ✅ .dockerignore loại trừ __pycache__, venv
+
+✅ 4. Health check endpoint (GET /health)
+     ✅ Code có route /health
+     ✅ Khi chạy: GET /health → 200 — uvicorn --workers 2
+
+✅ 5. Readiness endpoint (GET /ready)
+     ✅ Code có route /ready
+     ✅ Khi chạy: GET /ready → 200
+     ✅ Khi chạy: Redis mất kết nối → /ready 503 (còn /health vẫn 200)
+
+✅ 6. API Key authentication
+     ✅ Code đọc header X-API-Key
+     ✅ Khi chạy: thiếu / sai API key → 401
+     ✅ Khi chạy: API key đúng → 200
+
+✅ 7. Rate limiting
+     ✅ Code trả HTTP 429 khi vượt giới hạn
+     ✅ Khi chạy: vượt giới hạn → 429 — 429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)
+     ✅ Khi chạy: state nằm trong Redis — restart agent vẫn bị 429
+
+✅ 8. Cost guard
+     ✅ Code trả HTTP 402 khi hết budget
+     ✅ Khi chạy: hết budget → 402 — 402 ở request thứ 1
+
+✅ 9. Config từ environment variables
+     ✅ app/config.py đọc biến môi trường
+     ✅ .env.example liệt kê đủ biến cấu hình
+     ✅ .env nằm trong .gitignore
+     ✅ Không hard-code secret trong code
+     ✅ Khi chạy: agent dùng AGENT_API_KEY và RATE_LIMIT_PER_MINUTE từ env
+
+✅ 10. Structured logging
+     ✅ Code ghi log dạng JSON
+     ✅ Khi chạy: mọi dòng log của app là JSON hợp lệ — 17 dòng JSON
+
+✅ 11. Graceful shutdown
+     ✅ Code xử lý SIGTERM / lifespan shutdown
+     ✅ Khi chạy: SIGTERM lúc đang có request → request vẫn 200, process tự thoát — exit code 0
+     ✅ Docker: `docker stop` tắt êm (exit code 0, < 10s) — exit code 0, 0.7s
+
+✅ 12. Public URL ready (Railway / Render config)
+     ✅ Có railway.toml hoặc render.yaml (không chỉ toàn comment)
+     ✅ railway.toml: builder + healthcheckPath = "/health"
+     ✅ App lắng nghe theo biến PORT do platform cấp
+```
+
+</details>
+
+**Trước khi làm** (bản khung, `--static-only`): `Result: 0/12 tiêu chí đạt · 5/24 checks passed` — Dockerfile 1 lệnh `FROM` với `python:3.11`, không có `USER`/`HEALTHCHECK`; compose chỉ có `agent`; `.dockerignore`, `railway.toml` chỉ có comment; code chưa có `/health`, `/ready`, `X-API-Key`, 429, 402, log JSON, lifespan.
+
+### Cách tôi làm từng tiêu chí
+
+| # | Tiêu chí | File | Cách làm |
+|---|---|---|---|
+| 1 | Dockerfile multi-stage < 500 MB | `Dockerfile` | Stage `builder` (`python:3.11-slim`) cài thư viện vào virtualenv `/opt/venv`; stage `runtime` (`python:3.11-slim` sạch) chỉ copy `/opt/venv` + `app/` + `utils/`, tạo và chạy bằng user `app` (non-root), có `HEALTHCHECK` gọi `/health`. Image **183 MB**. Dùng venv thay vì `pip install --user` để user non-root luôn tìm thấy package (không phụ thuộc `HOME`/`PYTHONUSERBASE`) |
+| 2 | Compose agent + Redis | `docker-compose.yml` | `agent` build từ Dockerfile, đọc `.env` với `required: false`, `REDIS_URL=redis://redis:6379/0`, `depends_on: redis: condition: service_healthy`; `redis:7-alpine` có healthcheck `redis-cli ping`, volume + `--appendonly yes` để dữ liệu còn sau khi Redis restart |
+| 3 | `.dockerignore` | `.dockerignore` | Loại `.env`, `.env.*` (giữ `.env.example`), `__pycache__/`, `*.pyc`, `venv/`, `.venv/`, `.git/`, tài liệu, `benchmark-observability/`, script chấm |
+| 4 | `/health` (liveness) | `app/main.py` | Luôn 200 khi process còn chạy, **không gọi Redis** → container vẫn healthy khi Redis chưa lên (script chấm chạy container không có Redis) |
+| 5 | `/ready` (readiness) | `app/main.py`, `app/redis_client.py` | `redis_healthy()` ping Redis (timeout 2 s); lỗi → **503**. Client Redis tạo bằng `from_url` không kết nối lúc import nên app vẫn khởi động được khi Redis chết |
+| 6 | API key | `app/auth.py` | `APIKeyHeader("X-API-Key", auto_error=False)` + tự raise **401** cho cả thiếu và sai key (không dùng 403 như bản develop Part 4, không để FastAPI trả 422); so sánh bằng `secrets.compare_digest`; `AGENT_API_KEY` rỗng → từ chối mọi request |
+| 7 | Rate limit | `app/rate_limiter.py` | Sliding window 60 s bằng **Redis sorted set** theo từng API key (key Redis là hash của API key, không lưu key thật): `ZREMRANGEBYSCORE` → `ZCARD` → vượt `RATE_LIMIT_PER_MINUTE` thì **429** + `Retry-After` → `ZADD` + `EXPIRE`. State trong Redis nên 2 worker dùng chung và **restart vẫn bị 429** |
+| 8 | Cost guard | `app/cost_guard.py` | Key `cost:daily:{YYYY-MM-DD}` (UTC) → tự reset mỗi ngày; `check_budget()` trước khi gọi LLM, tổng ≥ `DAILY_BUDGET_USD` → **402**; `record_cost()` sau khi gọi LLM, cộng bằng `INCRBYFLOAT` (nguyên tử giữa các worker) + `EXPIRE` 2 ngày. Đây là cách đã đề xuất ở Exercise 4.4, sửa các vấn đề tìm thấy trong bản Part 4 (state trong RAM, tổng không reset) |
+| 9 | Config từ env | `app/config.py`, `.env.example` | Dataclass đọc `PORT`, `ENVIRONMENT`, `LOG_LEVEL`, `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD` bằng `os.getenv` (qua `default_factory`); **fail fast** khi `ENVIRONMENT=production` mà thiếu `AGENT_API_KEY`. `.env.example` liệt kê đủ biến, không có secret thật |
+| 10 | Log JSON | `app/main.py` | Tự viết `JsonFormatter` (`json.dumps`), gắn vào root logger bằng `basicConfig(..., force=True)` **trước** mọi lệnh log — tránh đúng lỗi phát hiện ở Part 1 (log bị cấu hình mặc định trước). Middleware ghi `{"event":"request","method","path","status","ms"}` cho mọi request; `/ask` ghi token và chi phí, **không ghi API key hay nội dung câu hỏi** |
+| 11 | Graceful shutdown | `app/main.py`, `Dockerfile` | Dùng `lifespan` (log `startup`/`shutdown`, đóng kết nối Redis); để uvicorn xử lý SIGTERM (không tự đè signal handler). `CMD ["sh","-c","exec uvicorn ..."]`: `exec` làm uvicorn thành **PID 1** nên nhận SIGTERM khi `docker stop`; `--timeout-graceful-shutdown 8` đảm bảo tắt trước khi Docker SIGKILL ở giây thứ 10. Kết quả: `docker stop` exit code 0 sau **0.7 s** |
+| 12 | Deploy config | `railway.toml`, `Dockerfile` | `builder = "DOCKERFILE"`, `healthcheckPath = "/health"`, restart khi lỗi; CMD nghe `--port ${PORT:-8000}` theo biến `PORT` do Railway cấp. Secret đặt trên dashboard, không ghi trong file |
+
+**Các điểm áp dụng từ những phần trước:**
+- `/ask` khai báo bằng `def` (không phải `async def`) → FastAPI chạy trong threadpool, lệnh Redis và LLM chặn đồng bộ **không khoá event loop** (lỗi quan sát được ở Exercise 5.2: 2 request mất ~6.6 s vì chạy nối tiếp).
+- Exception handler: lỗi Redis → **503** `"Service temporarily unavailable"`, lỗi khác → **500** `"Internal server error"`; stack trace chỉ ghi vào log JSON, **không trả ra client**. Input sai (`question` rỗng hoặc > 2000 ký tự) → **422** do Pydantic.
+- Thứ tự trong `/ask`: `Depends(verify_api_key)` (401) → `check_rate_limit` (429) → `check_budget` (402) → LLM → `record_cost` — request bị chặn ở bước nào cũng **không tốn tiền gọi LLM**.
+
+### Chạy thử bằng Docker Compose
+
+```text
+$ cp .env.example .env            # đổi AGENT_API_KEY thành key riêng; .env nằm trong .gitignore
+$ docker compose -p k5-day14-final up -d --build
+ ✔ Network k5-day14-final_default      Created
+ ✔ Volume "k5-day14-final_redis-data"  Created
+ ✔ Container k5-day14-final-redis-1    Healthy   5.9s
+ ✔ Container k5-day14-final-agent-1    Started   6.1s
+
+$ docker compose -p k5-day14-final ps
+NAME                     COMMAND                  SERVICE   STATUS                                     PORTS
+k5-day14-final-agent-1   "sh -c 'exec uvicorn…"   agent     Up Less than a second (health: starting)   0.0.0.0:8000->8000/tcp
+k5-day14-final-redis-1   "docker-entrypoint.s…"   redis     Up 6 seconds (healthy)                     6379/tcp
+
+$ docker compose -p k5-day14-final down
+```
+
+→ Agent chỉ start **sau khi** Redis `healthy` (`depends_on: condition: service_healthy`); lệnh khởi động là `sh -c 'exec uvicorn…'` đúng như Dockerfile.
+
+### Test tay qua Docker Compose
+
+Key được đọc từ `.env` vào biến shell, không gõ và không in ra màn hình:
+
+```text
+$ KEY=$(grep -E '^AGENT_API_KEY=' .env | cut -d= -f2- | tr -d '\r')
+$ docker compose -p k5-day14-final up -d
+ ✔ Container k5-day14-final-redis-1  Healthy   5.8s
+ ✔ Container k5-day14-final-agent-1  Started   5.9s
+
+$ curl -i http://localhost:8000/health
+HTTP/1.1 200 OK
+{"status":"ok","version":"1.0.0","environment":"development","uptime_seconds":7.0}
+
+$ curl -i http://localhost:8000/ready
+HTTP/1.1 200 OK
+{"ready":true,"redis":"ok"}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 401 Unauthorized
+www-authenticate: ApiKey
+{"detail":"Missing or invalid API key. Include header: X-API-Key: <key>"}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{"question":"What is deployment?"}'
+HTTP/1.1 200 OK
+{"question":"What is deployment?","answer":"Deployment là quá trình đưa code từ máy bạn lên server để người khác dùng được.","usage":{"input_tokens":4,"output_tokens":19,"cost_usd":1.2e-05}}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{"question":""}'
+HTTP/1.1 422 Unprocessable Entity
+{"detail":[{"type":"string_too_short","loc":["body","question"],"msg":"String should have at least 1 character","input":"","ctx":{"min_length":1}}]}
+
+$ docker compose -p k5-day14-final logs agent | tail -6
+agent-1  | INFO:     172.20.0.1:46618 - "POST /ask HTTP/1.1" 401 Unauthorized
+agent-1  | {"ts": "2026-11-26T09:51:46.947+00:00", "lvl": "INFO", "logger": "agent", "msg": "ask", "event": "ask", "user_id": null, "question_chars": 19, "input_tokens": 4, "output_tokens": 19, "cost_usd": 1.2e-05}
+agent-1  | {"ts": "2026-11-26T09:51:46.948+00:00", "lvl": "INFO", "logger": "agent", "msg": "request", "event": "request", "method": "POST", "path": "/ask", "status": 200, "ms": 147.3}
+agent-1  | INFO:     172.20.0.1:46620 - "POST /ask HTTP/1.1" 200 OK
+agent-1  | {"ts": "2026-11-26T09:51:46.958+00:00", "lvl": "INFO", "logger": "agent", "msg": "request", "event": "request", "method": "POST", "path": "/ask", "status": 422, "ms": 0.9}
+agent-1  | INFO:     172.20.0.1:46630 - "POST /ask HTTP/1.1" 422 Unprocessable Entity
+
+$ docker compose -p k5-day14-final down
+```
+
+**Quan sát:**
+
+| Quan sát | Ý nghĩa |
+|---|---|
+| `/health` 200, `/ready` 200 với `"redis":"ok"`, không key → **401**, đúng key → **200**, câu hỏi rỗng → **422** | Đủ các mã trả về theo yêu cầu; lỗi input trả JSON nêu rõ trường sai (`body.question`, `min_length: 1`), không có stack trace |
+| `cost_usd: 1.2e-05` với 4 input + 19 output token | Tự kiểm lại: `4/1000 × 0.00015 + 19/1000 × 0.0006 = 0.0000006 + 0.0000114 = 0.000012` ✅ |
+| Log app là JSON (`event: ask` / `event: request`, có `status`, `ms`) xen kẽ với dòng access log dạng chữ của uvicorn | Log của app parse được bằng máy; dòng `INFO: ...` là của uvicorn (script chấm không tính). Log `ask` chỉ ghi **độ dài** câu hỏi, token, chi phí — **không ghi API key và nội dung câu hỏi** |
+| `ms: 147.3` cho request 200, `ms: 0.9` cho request 422 | Request hợp lệ tốn ~0.15 s chủ yếu do mock LLM (`delay=0.1` + ngẫu nhiên); request lỗi input bị chặn trước khi gọi LLM nên gần như không tốn thời gian (và không tốn tiền) |
+| Request rỗng nhưng **sai key** (lần thử trước) trả **401**, không phải 422 | Xác thực chạy trước kiểm tra nội dung → người không có key không dò được định dạng input của API |
+
+**Sự cố gặp khi test — ký tự `\r`:** lần đầu lấy key bằng `grep | cut` (không có `tr -d '\r'`), hai request có key trả **400 `Invalid HTTP request received`** từ uvicorn và log của app không có dòng nào cho chúng. Nguyên nhân: tôi sửa file trên Windows nên `.env` dùng xuống dòng CRLF; trong bash, key bị dính `\r` (độ dài 6 thay vì 5) → header HTTP không hợp lệ, uvicorn từ chối trước khi request vào app. Docker Compose tự bỏ `\r` khi đọc `env_file` nên agent vẫn nhận đúng key (độ dài 5) — lỗi chỉ nằm ở lệnh test. Cách sửa: thêm `tr -d '\r'`, hoặc chuyển `.env` sang LF (`sed -i 's/\r$//' .env`).
+
+---
+
 ## AI log
 
 | Thời gian | Hỏi AI gì | Nhận được gì | Tôi tự sửa / kiểm tra thế nào |
@@ -1390,3 +1589,8 @@ Kết luận:
 | 2026-11-26 | Claude Code: trình bày Exercise 4.4 (cost guard) từ output `/me/usage` tôi tự chạy, và đề xuất cách implement bằng Redis | Giải thích luồng check/record, bảng nhận xét (state trong RAM, `_global_today` không được dùng nên tổng toàn hệ thống không reset, race condition, múi giờ), code mẫu Redis $10/tháng | Tự tính lại cost 2 input + 30 output token = $0.0000183 khớp `cost_usd`; Claude grep xác nhận `_global_today` chỉ xuất hiện ở dòng 50; code Redis sẽ được tôi dùng và kiểm tra thật ở Part 6 |
 | 2026-11-26 | Claude Code: hướng dẫn CP4 và trình bày Exercise 5.1, 5.2 từ output tôi tự chạy | Bảng liveness vs readiness, so sánh SIGTERM vs SIGKILL, phát hiện `time.sleep` trong `async def` khoá event loop (2 request ~6.6 s), vòng chờ in-flight trong lifespan không có tác dụng, `/ready` không kịp trả 503 khi tắt | mọi thời gian (3.016 s, 6.6 s, 16:11:01→16:11:10), mã 200/000 và log là của tôi; đối chiếu số dòng trong `develop/app.py` |
 | 2026-11-26 | Claude Code: trình bày Exercise 5.3, 5.4, 5.5 từ output Docker/curl/`test_stateless.py` và thí nghiệm tắt instance tôi tự chạy | Giải thích anti-pattern vs Redis, bảng quan sát round-robin, phát hiện lỗi đếm `turn` (off-by-one), fallback RAM âm thầm, đọc–sửa–ghi không nguyên tử, Nginx chỉ resolve DNS lúc khởi động | Đọc code xác nhận 5.3; mọi output (instance ID, 3/3/4, history 10 và 8 message, turn 3-4-5) là của tôi; tự đối chiếu: 4 lượt hỏi nhưng turn báo tới 5 → xác nhận off-by-one ở `app.py` dòng 140-154; đã `down` stack |
+| 2026-11-26 | Claude Code: đọc `check_production_ready.py` để liệt kê điều kiện chấm, hướng dẫn CP5 kèm code mẫu cho từng TODO (config, redis_client, auth, rate_limiter, cost_guard, main, Dockerfile, .dockerignore, compose, railway.toml) | Code cho 12 tiêu chí và giải thích từng lựa chọn (venv trong Dockerfile, `exec` để uvicorn là PID 1, Redis sorted set, INCRBYFLOAT, JSON formatter với `force=True`, `def` thay `async def`) | Tôi tự đưa code vào từng file, tôi tự chạy `--static-only` (0/12) → `docker compose up` → `check_production_ready.py` đầy đủ: PASS 12/12, 41/41, image 183 MB, docker stop 0.7 s |
+| 2026-11-26 | Claude Code: chẩn đoán lỗi 400 `Invalid HTTP request received` khi test tay `/ask` | Nguyên nhân: `.env` dùng CRLF, key lấy bằng `grep|cut` dính `
+` (6 ký tự), còn Docker Compose đọc đúng 5 ký tự; cách sửa `tr -d '
+'` | Tôi chạy lại với `tr -d '
+'`: 200/200/401/200/422 đúng như mong đợi, tự kiểm lại cost 1.2e-05 từ số token |
